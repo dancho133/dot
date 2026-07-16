@@ -45,6 +45,13 @@ HERE = Path(__file__).parent
 VOCAB_FILE = HERE / "vocab.txt"
 CORRECTIONS_FILE = HERE / "corrections.json"
 STATE_FILE = HERE / "state.json"
+HISTORY_FILE = HERE / "history.jsonl"  # журнал всех расшифровок, по строке на запись
+
+# Образец стиля для Whisper. Раньше сюда шёл список слов через запятую — модель
+# принимала его за образец текста и переставала ставить точки. Теперь словарь
+# уходит в hotwords (отдельный канал подсказок), а здесь живёт нормальная
+# фраза с пунктуацией, на которую модель равняется.
+STYLE_PROMPT = "Запишу мысль. Во-первых, про проект: план, сроки, деньги. Дальше — что делать?"
 
 MODEL = "large-v3-turbo"
 LANGUAGE = "ru"
@@ -231,7 +238,8 @@ class Transcriber:
             audio,
             language=LANGUAGE,
             beam_size=5,
-            initial_prompt=read_vocab(),
+            initial_prompt=STYLE_PROMPT,
+            hotwords=read_vocab(),
             vad_filter=True,
             condition_on_previous_text=False,
         )
@@ -417,7 +425,21 @@ class Dot(QWidget):
         if not raw:
             return
         self.last_raw = raw
-        self.paste(apply_corrections(raw))
+        text = apply_corrections(raw)
+        self.remember(text)
+        self.paste(text)
+
+    def remember(self, text: str) -> None:
+        """Журнал расшифровок: продиктовал и случайно затёр — не пропало."""
+        entry = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "text": text}
+        with HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def cancel(self) -> None:
+        """Передумал: выбросить запись, ничего не расшифровывать."""
+        if self.state == REC:
+            self.recorder.stop()
+            self.state = IDLE
 
     def _on_failed(self) -> None:
         self.state = ERR
@@ -461,6 +483,8 @@ class Dot(QWidget):
         if event.button() == Qt.LeftButton:
             self._press = event.globalPosition() - QPointF(self.x(), self.y())
             self._moved = False
+        elif event.button() == Qt.RightButton:
+            self.cancel()
 
     def mouseMoveEvent(self, event) -> None:
         if self._press is None:
