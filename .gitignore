@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.test-tmp/
+
+# Личное: где стоит точка и что она успела выучить с твоего голоса.
+state.json
+corrections.json
+
+# Картинки собираются из preview.py одной командой.
+preview.png
+preview-zoom.png
