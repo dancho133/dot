@@ -17,3 +17,5 @@ MVP
 Site Screening
 питчинг
 акселератор
+speech to Text
+школа-лицей

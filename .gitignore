@@ -6,6 +6,7 @@ __pycache__/
 state.json
 corrections.json
 history.jsonl
+last.wav
 
 # Картинки собираются из preview.py одной командой.
 preview.png

@@ -20,6 +20,7 @@ import re
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 # CUDA-библиотеки приезжают пакетами nvidia-*, но Windows сама их не находит.
@@ -46,6 +47,7 @@ VOCAB_FILE = HERE / "vocab.txt"
 CORRECTIONS_FILE = HERE / "corrections.json"
 STATE_FILE = HERE / "state.json"
 HISTORY_FILE = HERE / "history.jsonl"  # журнал всех расшифровок, по строке на запись
+LAST_AUDIO_FILE = HERE / "last.wav"  # последняя запись: без неё модели не сравнить
 
 # Образец стиля для Whisper. Раньше сюда шёл список слов через запятую — модель
 # принимала его за образец текста и переставала ставить точки. Теперь словарь
@@ -53,7 +55,12 @@ HISTORY_FILE = HERE / "history.jsonl"  # журнал всех расшифро�
 # фраза с пунктуацией, на которую модель равняется.
 STYLE_PROMPT = "Запишу мысль. Во-первых, про проект: план, сроки, деньги. Дальше — что делать?"
 
-MODEL = "large-v3-turbo"
+# large-v3, а не large-v3-turbo. Turbo — дистилляция с 4 слоями декодера вместо
+# 32: быстрее, но на тихом и шумном звуке срывается в выдумывание и начинает
+# выдавать содержимое подсказок вместо речи. Замер на одном и том же звуке:
+# turbo 3.00 c и "мем пролосей" вместо mempalace, large-v3 4.42 c и mempalace.
+# Полторы секунды за слово, которое ты диктуешь каждый день, — честный обмен.
+MODEL = "large-v3"
 LANGUAGE = "ru"
 SAMPLE_RATE = 16000
 
@@ -65,6 +72,33 @@ SAMPLE_RATE = 16000
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 _u32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
 _u32.RegisterHotKey.restype = wt.BOOL
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype = wt.HANDLE
+
+MUTEX_NAME = "dot-dictation-single-instance"
+ERROR_ALREADY_EXISTS = 183
+MB_ICONWARNING = 0x30
+
+
+def alarm(text: str) -> None:
+    """Под pythonw консоли нет и stderr улетает в никуда — потому ещё и окном.
+
+    Именно так и потерялся день: два экземпляра дрались за Ctrl+Alt+D, тот, что
+    проиграл, честно написал об этом в stderr, а stderr у pythonw — /dev/null.
+    """
+    if sys.stderr is not None:
+        print(text, file=sys.stderr)
+    _u32.MessageBoxW(None, text, "dot", MB_ICONWARNING)
+
+
+def already_running(name: str = MUTEX_NAME) -> bool:
+    """Мьютекс держится процессом до самой смерти — освобождать руками не надо.
+
+    Имя — параметром: под настоящим именем ответ зависит от того, запущен ли
+    сейчас dot, и проверка ловила бы живую точку вместо собственной логики.
+    """
+    _k32.CreateMutexW(None, True, name)
+    return ctypes.get_last_error() == ERROR_ALREADY_EXISTS
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 WM_HOTKEY = 0x0312
@@ -207,6 +241,35 @@ class Recorder:
             return np.concatenate(self._frames, axis=0).ravel()
 
 
+def normalize(audio: np.ndarray) -> np.ndarray:
+    """Поднять запись до пика -3 дБ.
+
+    Встроенный микрофон ноутбука пишет тихо, а тихое Whisper не столько теряет,
+    сколько ДОДУМЫВАЕТ: не расслышал слово — подставил похожее. Замер на живой
+    диктовке: "и человека ноги" превратилось в "три человека", и расшифровка
+    стала на четверть быстрее — модель перестала перебирать варианты.
+
+    Порог на пик обязателен: на паузе усиление растянуло бы один шум.
+    """
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    if peak < 1e-4:
+        return audio
+    return (audio * (0.7 / peak)).astype(np.float32)
+
+
+def save_audio(audio: np.ndarray) -> None:
+    """Последняя запись остаётся на диске.
+
+    Сравнить две модели можно только на ОДНОМ и том же звуке, а голос без файла
+    не повторишь: скажешь второй раз — уже другая интонация и другой шум.
+    """
+    with wave.open(str(LAST_AUDIO_FILE), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+
+
 class Transcriber:
     def __init__(self) -> None:
         self.model = None
@@ -217,7 +280,12 @@ class Transcriber:
         from faster_whisper import WhisperModel
 
         last: Exception | None = None
-        for device, compute in (("cuda", "float16"), ("cpu", "int8")):
+        # int8_float16 первым не ради экономии, а потому что он просто лучше:
+        # на одном и том же звуке текст вышел символ в символ как у float16,
+        # памяти вдвое меньше (2.0 ГБ против 3.9), а считает втрое быстрее —
+        # у Ampere int8 идёт на отдельных тензорных ядрах. float16 остаётся
+        # запасным: на картах без int8-ядер он не медленнее.
+        for device, compute in (("cuda", "int8_float16"), ("cuda", "float16"), ("cpu", "int8")):
             try:
                 self.model = WhisperModel(MODEL, device=device, compute_type=compute)
                 # Модель охотно создаётся на CUDA и падает только на первом же
@@ -235,7 +303,7 @@ class Transcriber:
 
     def run(self, audio: np.ndarray) -> str:
         segments, _ = self.model.transcribe(
-            audio,
+            normalize(audio),
             language=LANGUAGE,
             beam_size=5,
             initial_prompt=STYLE_PROMPT,
@@ -360,7 +428,7 @@ class Dot(QWidget):
                 if err == ERROR_HOTKEY_ALREADY_REGISTERED
                 else f"ошибка Windows {err}"
             )
-            print(f"клавиша {label} не работает: {why}", file=sys.stderr)
+            alarm(f"клавиша {label} не работает: {why}")
 
     # позиция
 
@@ -389,7 +457,7 @@ class Dot(QWidget):
 
     def _on_ready(self, problem: str) -> None:
         if problem:
-            print(f"модель не загрузилась: {self.transcriber.error}", file=sys.stderr)
+            alarm(f"модель не загрузилась: {self.transcriber.error}")
             self.state = ERR
             return
         self.state = IDLE
@@ -400,7 +468,16 @@ class Dot(QWidget):
 
     def toggle(self) -> None:
         if self.state == IDLE:
-            self.recorder.start()
+            try:
+                self.recorder.start()
+            except Exception as exc:
+                # Микрофон могли занять (созвон, браузер) или сменить устройство
+                # по умолчанию. Без этого нажатие просто НИЧЕГО не делало: Qt
+                # съедал исключение в слоте, точка оставалась спящей, и человек
+                # жал клавишу снова и снова.
+                alarm(f"микрофон не открылся: {exc}")
+                self._on_failed()
+                return
             self.state = REC
         elif self.state == REC:
             audio = self.recorder.stop()
@@ -413,9 +490,10 @@ class Dot(QWidget):
             self.bridge.done.emit("")
             return
         try:
+            save_audio(audio)
             raw = self.transcriber.run(audio)
         except Exception as exc:
-            print(f"расшифровка сорвалась: {exc}", file=sys.stderr)
+            alarm(f"расшифровка сорвалась: {exc}")
             self.bridge.failed.emit()
             return
         self.bridge.done.emit(raw)
@@ -610,6 +688,9 @@ class Dot(QWidget):
 
 
 def main() -> None:
+    if already_running():
+        alarm("dot уже запущен. Второй экземпляр отобрал бы Ctrl+Alt+D у первого.")
+        sys.exit(1)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     dot = Dot()

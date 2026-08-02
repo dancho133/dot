@@ -71,6 +71,24 @@ def test_no_duplicates_in_vocab():
     assert dot.VOCAB_FILE.read_text("utf-8").split() == ["Double", "Дан", "Astana"]
 
 
+def test_normalize_lifts_quiet_and_spares_silence():
+    import numpy as np
+
+    quiet = (np.sin(np.linspace(0, 40, 16000)) * 0.02).astype(np.float32)
+    assert abs(float(np.abs(dot.normalize(quiet)).max()) - 0.7) < 0.01
+    # Тишину трогать нельзя: усиление растянуло бы один шум.
+    silence = np.zeros(16000, dtype=np.float32)
+    assert float(np.abs(dot.normalize(silence)).max()) == 0.0
+    assert dot.normalize(np.zeros(0, dtype=np.float32)).size == 0
+
+
+def test_second_instance_is_refused():
+    # Своё имя, а не боевое: под боевым ответ зависел бы от того, запущен ли dot.
+    name = "dot-test-mutex"
+    assert dot.already_running(name) is False
+    assert dot.already_running(name) is True
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
