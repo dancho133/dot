@@ -198,9 +198,10 @@ def wav_bytes(audio: np.ndarray) -> bytes:
 
 def normalize(audio: np.ndarray) -> np.ndarray:
     peak = float(np.abs(audio).max()) if audio.size else 0.0
-    if peak < 1e-4:
+    if peak < 0.01:
         return audio
-    return (audio * (0.7 / peak)).astype(np.float32)
+    gain = min(0.7 / peak, 5.0)
+    return (audio * gain).astype(np.float32)
 
 
 def save_audio(audio: np.ndarray) -> None:
@@ -348,7 +349,7 @@ class Dot(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
 
-        self.state = LOADING
+        self.state = IDLE
         self.hover = False
         self.level = 0.0
         self.peak = 0.0
