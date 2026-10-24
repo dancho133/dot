@@ -50,6 +50,8 @@ STYLE_PROMPT = "Запишу мысль. Во-первых, про проект:
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 _u32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
 _u32.RegisterHotKey.restype = wt.BOOL
+_u32.UnregisterHotKey.argtypes = [wt.HWND, ctypes.c_int]
+_u32.UnregisterHotKey.restype = wt.BOOL
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _k32.CreateMutexW.restype = wt.HANDLE
 
@@ -208,7 +210,7 @@ def save_audio(audio: np.ndarray) -> None:
 def groq_transcribe(audio: np.ndarray) -> str:
     key = groq_api_key()
     if not key:
-        raise RuntimeError("Groq API key не задан")
+        raise RuntimeError("Groq API key не найден в state.json")
     model = groq_model()
     audio_data = wav_bytes(normalize(audio))
 
@@ -327,6 +329,7 @@ class HotkeyFilter(QAbstractNativeEventFilter):
             handler = self.handlers.get(int(msg.wParam))
             if handler is not None:
                 handler()
+            return True, 0
         return False, 0
 
 
@@ -355,6 +358,7 @@ class Dot(QWidget):
         self.backend_status = "проверяется..."
         self._press: QPointF | None = None
         self._moved = False
+        self._last_toggle_time = 0.0
 
         self._apply_saved_position()
 
@@ -381,13 +385,18 @@ class Dot(QWidget):
         )
         QApplication.instance().installNativeEventFilter(self._filter)
 
-        hwnd = int(self.winId())
+        # Регистрируем на поток (HWND = None), чтобы Qt не дублировал сообщение окна
         for hid, (mod, vk, name) in (
             (HOTKEY_TALK_ID, HOTKEY_TALK),
             (HOTKEY_LEARN_ID, HOTKEY_LEARN),
         ):
-            if not _u32.RegisterHotKey(hwnd, hid, mod | MOD_NOREPEAT, vk):
+            if not _u32.RegisterHotKey(None, hid, mod | MOD_NOREPEAT, vk):
                 alarm(f"Хоткей {name} занят другой программой.")
+
+    def closeEvent(self, event) -> None:
+        _u32.UnregisterHotKey(None, HOTKEY_TALK_ID)
+        _u32.UnregisterHotKey(None, HOTKEY_LEARN_ID)
+        super().closeEvent(event)
 
     def _apply_saved_position(self) -> None:
         geom = QGuiApplication.primaryScreen().availableGeometry()
@@ -418,6 +427,11 @@ class Dot(QWidget):
         print(f"dot готов [{info}]. {HOTKEY_TALK[2]} — говорить, {HOTKEY_LEARN[2]} — научить.")
 
     def toggle(self) -> None:
+        now = time.time()
+        if now - self._last_toggle_time < 0.35:
+            return
+        self._last_toggle_time = now
+
         if self.state == IDLE:
             try:
                 self.recorder.start()
@@ -502,6 +516,8 @@ class Dot(QWidget):
         quit_action = menu.addAction("Выход")
         chosen = menu.exec(position)
         if chosen is quit_action:
+            _u32.UnregisterHotKey(None, HOTKEY_TALK_ID)
+            _u32.UnregisterHotKey(None, HOTKEY_LEARN_ID)
             QApplication.quit()
 
     def enterEvent(self, event) -> None:
