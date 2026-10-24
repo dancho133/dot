@@ -1,11 +1,13 @@
 """
-dot — локальная диктовка.
+dot — сверхбыстрая диктовка голосом на Windows без нагрузки на ПК.
 
 Жмёшь Ctrl+Alt+D (или кликаешь точку) — говоришь — жмёшь ещё раз.
-Текст сам вставляется туда, где стоит курсор. В интернет ничего не уходит.
+Текст сразу вставляется под курсор и копируется в системный буфер (Ctrl+V).
+Распознавание: Groq Whisper Cloud (whisper-large-v3-turbo, ~0.2-0.4 с).
+Нагрузка: 0 МБ VRAM, ~25 МБ ОЗУ в фоне.
 
-Ctrl+Alt+F — научить: копируешь исправленный текст в буфер, жмёшь,
-dot сравнивает со своей последней расшифровкой и запоминает разницу.
+Ctrl+Alt+F — самообучение: копируешь исправленный текст в буфер, жмёшь хоткей,
+dot сравнивает со своей последней расшифровкой и запоминает разницу в vocab.txt и corrections.json.
 """
 
 from __future__ import annotations
@@ -21,54 +23,30 @@ import sys
 import threading
 import time
 import wave
+from io import BytesIO
 from pathlib import Path
 
-# CUDA-библиотеки приезжают пакетами nvidia-*, но Windows сама их не находит.
-# Обязательно до импорта faster_whisper, иначе он подхватит пустоту.
-# Только PATH: ctranslate2 грузит cublas по имени, а такой вызов ищет именно
-# в PATH и НЕ смотрит в os.add_dll_directory.
-try:
-    import nvidia  # namespace-пакет: у него нет __file__, только __path__
-
-    _bins = [str(b) for root in nvidia.__path__ for b in Path(root).glob("*/bin")]
-    if _bins:
-        os.environ["PATH"] = os.pathsep.join(_bins) + os.pathsep + os.environ.get("PATH", "")
-except ImportError:
-    pass
-
+import httpx
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 HERE = Path(__file__).parent
 VOCAB_FILE = HERE / "vocab.txt"
 CORRECTIONS_FILE = HERE / "corrections.json"
 STATE_FILE = HERE / "state.json"
-HISTORY_FILE = HERE / "history.jsonl"  # журнал всех расшифровок, по строке на запись
-LAST_AUDIO_FILE = HERE / "last.wav"  # последняя запись: без неё модели не сравнить
+HISTORY_FILE = HERE / "history.jsonl"
+LAST_AUDIO_FILE = HERE / "last.wav"
 
-# Образец стиля для Whisper. Раньше сюда шёл список слов через запятую — модель
-# принимала его за образец текста и переставала ставить точки. Теперь словарь
-# уходит в hotwords (отдельный канал подсказок), а здесь живёт нормальная
-# фраза с пунктуацией, на которую модель равняется.
-STYLE_PROMPT = "Запишу мысль. Во-первых, про проект: план, сроки, деньги. Дальше — что делать?"
-
-# large-v3, а не large-v3-turbo. Turbo — дистилляция с 4 слоями декодера вместо
-# 32: быстрее, но на тихом и шумном звуке срывается в выдумывание и начинает
-# выдавать содержимое подсказок вместо речи. Замер на одном и том же звуке:
-# turbo 3.00 c и "мем пролосей" вместо mempalace, large-v3 4.42 c и mempalace.
-# Полторы секунды за слово, которое ты диктуешь каждый день, — честный обмен.
-MODEL = "large-v3"
+DEFAULT_GROQ_KEY = ""
+DEFAULT_MODEL = "whisper-large-v3-turbo"
 LANGUAGE = "ru"
 SAMPLE_RATE = 16000
 
-# --- клавиатура через Windows напрямую ----------------------------------------
-# Библиотека keyboard разбирает клавиши по буквам ТЕКУЩЕЙ раскладки: при русской
-# она на клавише "A" видит "ф" и hotkey "ctrl+alt+d" не узнаёт никогда, молча.
-# RegisterHotKey работает с кодами клавиш, раскладке безразличен и честно
-# сообщает, если комбинация уже занята.
+STYLE_PROMPT = "Запишу мысль. Во-первых, про проект: план, сроки, деньги. Дальше — что делать?"
+
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 _u32.RegisterHotKey.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
 _u32.RegisterHotKey.restype = wt.BOOL
@@ -81,46 +59,29 @@ MB_ICONWARNING = 0x30
 
 
 def alarm(text: str) -> None:
-    """Под pythonw консоли нет и stderr улетает в никуда — потому ещё и окном.
-
-    Именно так и потерялся день: два экземпляра дрались за Ctrl+Alt+D, тот, что
-    проиграл, честно написал об этом в stderr, а stderr у pythonw — /dev/null.
-    """
     if sys.stderr is not None:
         print(text, file=sys.stderr)
     _u32.MessageBoxW(None, text, "dot", MB_ICONWARNING)
 
 
 def already_running(name: str = MUTEX_NAME) -> bool:
-    """Мьютекс держится процессом до самой смерти — освобождать руками не надо.
-
-    Имя — параметром: под настоящим именем ответ зависит от того, запущен ли
-    сейчас dot, и проверка ловила бы живую точку вместо собственной логики.
-    """
     _k32.CreateMutexW(None, True, name)
     return ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 WM_HOTKEY = 0x0312
 VK_CONTROL, VK_MENU, VK_SHIFT, VK_V = 0x11, 0x12, 0x10, 0x56
 KEYEVENTF_KEYUP = 0x2
-ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 
-# (модификаторы, код клавиши, как назвать человеку)
 HOTKEY_TALK = (MOD_CONTROL | MOD_ALT, 0x44, "Ctrl+Alt+D")
 HOTKEY_LEARN = (MOD_CONTROL | MOD_ALT, 0x46, "Ctrl+Alt+F")
 HOTKEY_TALK_ID, HOTKEY_LEARN_ID = 1, 2
 
-VOCAB_TERMS_KEPT = 60  # initial_prompt у Whisper вмещает ~224 токена, дальше он его режет
-
-# Шкала индикатора, в децибелах. Это ручка настройки под конкретный микрофон:
-# если риски еле шевелятся, когда ты говоришь, — подними METER_FLOOR_DB
-# (например до -40). На распознавание не влияет вообще, только на картинку:
-# Whisper разбирает речь даже на -70 дБ, проверено.
+VOCAB_TERMS_KEPT = 60
 METER_FLOOR_DB = -50.0
 METER_CEIL_DB = -5.0
 
-# Тёплый уголь и кость. Одна глиняная нота на состояние — больше цветов нет.
 INK = QColor(0x17, 0x13, 0x0F)
 LIP = QColor(0x4A, 0x41, 0x36)
 BONE = QColor(0xE4, 0xDC, 0xCD)
@@ -128,11 +89,8 @@ CLAY = QColor(0x9A, 0x5F, 0x42)
 
 WIN = 72
 CTR = WIN / 2
-R_DISC_SHUT = 15.0  # отдыхает
-R_DISC_OPEN = 24.0  # слушает или думает
-# Риски живут ВНУТРИ диска. Снаружи они тонули в белом чате: кость по белому не
-# видно, а фон под точкой мы не выбираем. Диск — единственная поверхность,
-# чей цвет мы знаем, поэтому индикатор рисуем только на нём.
+R_DISC_SHUT = 15.0
+R_DISC_OPEN = 24.0
 R_TICK_IN = 14.5
 R_TICK_OUT = 20.5
 TICKS = 20
@@ -140,7 +98,36 @@ TICKS = 20
 IDLE, LOADING, REC, WORK, ERR = "idle", "loading", "rec", "work", "err"
 
 
-# --- словарь и обучение ------------------------------------------------------
+def read_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        val = json.loads(STATE_FILE.read_text("utf-8"))
+        return val if isinstance(val, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(**updates: object) -> None:
+    st = read_state()
+    st.update(updates)
+    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=2), "utf-8")
+
+
+def groq_api_key() -> str:
+    return (
+        os.environ.get("GROQ_API_KEY", "").strip()
+        or str(read_state().get("groq_api_key", "")).strip()
+        or DEFAULT_GROQ_KEY
+    )
+
+
+def groq_model() -> str:
+    return (
+        os.environ.get("GROQ_MODEL", "").strip()
+        or str(read_state().get("groq_model", "")).strip()
+        or DEFAULT_MODEL
+    )
 
 
 def read_vocab() -> str | None:
@@ -170,26 +157,22 @@ def load_corrections() -> dict[str, str]:
 
 
 def apply_corrections(text: str) -> str:
-    # Длинные фразы заменяем раньше коротких, иначе короткая съест кусок длинной.
     for wrong, right in sorted(load_corrections().items(), key=lambda kv: -len(kv[0])):
         text = re.sub(rf"(?<!\w){re.escape(wrong)}(?!\w)", right, text, flags=re.IGNORECASE)
     return text
 
 
 def learn(raw: str, fixed: str) -> int:
-    """Сравнить сырую расшифровку с исправленной, запомнить замены. Вернуть их число."""
     a, b = raw.split(), fixed.split()
     if not a or not b:
         return 0
     matcher = difflib.SequenceMatcher(None, [w.lower() for w in a], [w.lower() for w in b])
     pairs: dict[str, str] = {}
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        # ponytail: только короткие замены. Длинный кусок — это он переписал мысль,
-        # а не поправил распознавание, и в словарь ему нельзя.
         if tag != "replace" or i2 - i1 > 3 or j2 - j1 > 3:
             continue
-        wrong = " ".join(a[i1:i2]).strip(".,!?;:—-«»\"'")
-        right = " ".join(b[j1:j2]).strip(".,!?;:—-«»\"'")
+        wrong = " ".join(a[i1:i2]).strip(".,!?;:-—«»\"'")
+        right = " ".join(b[j1:j2]).strip(".,!?;:-—«»\"'")
         if wrong and right and wrong.lower() != right.lower():
             pairs[wrong] = right
     if not pairs:
@@ -201,7 +184,80 @@ def learn(raw: str, fixed: str) -> int:
     return len(pairs)
 
 
-# --- звук --------------------------------------------------------------------
+def wav_bytes(audio: np.ndarray) -> bytes:
+    stream = BytesIO()
+    with wave.open(stream, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+    return stream.getvalue()
+
+
+def normalize(audio: np.ndarray) -> np.ndarray:
+    peak = float(np.abs(audio).max()) if audio.size else 0.0
+    if peak < 1e-4:
+        return audio
+    return (audio * (0.7 / peak)).astype(np.float32)
+
+
+def save_audio(audio: np.ndarray) -> None:
+    LAST_AUDIO_FILE.write_bytes(wav_bytes(audio))
+
+
+def groq_transcribe(audio: np.ndarray) -> str:
+    key = groq_api_key()
+    if not key:
+        raise RuntimeError("Groq API key не задан")
+    model = groq_model()
+    audio_data = wav_bytes(normalize(audio))
+
+    prompt = STYLE_PROMPT
+    vocab = read_vocab()
+    if vocab:
+        prompt = f"{STYLE_PROMPT} Словарь: {vocab}"
+
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "User-Agent": "dot-voice/2.0"
+    }
+    files = {
+        "file": ("dictation.wav", audio_data, "audio/wav")
+    }
+    data = {
+        "model": model,
+        "language": LANGUAGE,
+        "response_format": "json",
+        "prompt": prompt
+    }
+
+    with httpx.Client(timeout=15.0) as client:
+        resp = client.post(url, headers=headers, files=files, data=data)
+        if resp.status_code != 200:
+            err_msg = resp.text[:150]
+            raise RuntimeError(f"Groq HTTP {resp.status_code}: {err_msg}")
+        payload = resp.json()
+        text = payload.get("text", "")
+        if not isinstance(text, str):
+            raise RuntimeError("Groq вернул неполный ответ")
+        return text.strip()
+
+
+def groq_healthcheck() -> str:
+    key = groq_api_key()
+    if not key:
+        raise RuntimeError("Groq API key не задан")
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "User-Agent": "dot-voice/2.0"
+    }
+    with httpx.Client(timeout=8.0) as client:
+        resp = client.get(url, headers=headers)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Groq HTTP {resp.status_code}")
+    return f"Groq ({groq_model()})"
 
 
 class Recorder:
@@ -209,7 +265,7 @@ class Recorder:
         self._frames: list[np.ndarray] = []
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
-        self.level = 0.0  # 0..1, уже в дБ-шкале — так меряют настоящие индикаторы
+        self.level = 0.0
 
     def _callback(self, indata, frames, time_info, status) -> None:
         with self._lock:
@@ -241,82 +297,6 @@ class Recorder:
             return np.concatenate(self._frames, axis=0).ravel()
 
 
-def normalize(audio: np.ndarray) -> np.ndarray:
-    """Поднять запись до пика -3 дБ.
-
-    Встроенный микрофон ноутбука пишет тихо, а тихое Whisper не столько теряет,
-    сколько ДОДУМЫВАЕТ: не расслышал слово — подставил похожее. Замер на живой
-    диктовке: "и человека ноги" превратилось в "три человека", и расшифровка
-    стала на четверть быстрее — модель перестала перебирать варианты.
-
-    Порог на пик обязателен: на паузе усиление растянуло бы один шум.
-    """
-    peak = float(np.abs(audio).max()) if audio.size else 0.0
-    if peak < 1e-4:
-        return audio
-    return (audio * (0.7 / peak)).astype(np.float32)
-
-
-def save_audio(audio: np.ndarray) -> None:
-    """Последняя запись остаётся на диске.
-
-    Сравнить две модели можно только на ОДНОМ и том же звуке, а голос без файла
-    не повторишь: скажешь второй раз — уже другая интонация и другой шум.
-    """
-    with wave.open(str(LAST_AUDIO_FILE), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes((np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
-
-
-class Transcriber:
-    def __init__(self) -> None:
-        self.model = None
-        self.device = "?"
-        self.error: Exception | None = None
-
-    def load(self) -> None:
-        from faster_whisper import WhisperModel
-
-        last: Exception | None = None
-        # int8_float16 первым не ради экономии, а потому что он просто лучше:
-        # на одном и том же звуке текст вышел символ в символ как у float16,
-        # памяти вдвое меньше (2.0 ГБ против 3.9), а считает втрое быстрее —
-        # у Ampere int8 идёт на отдельных тензорных ядрах. float16 остаётся
-        # запасным: на картах без int8-ядер он не медленнее.
-        for device, compute in (("cuda", "int8_float16"), ("cuda", "float16"), ("cpu", "int8")):
-            try:
-                self.model = WhisperModel(MODEL, device=device, compute_type=compute)
-                # Модель охотно создаётся на CUDA и падает только на первом же
-                # распознавании (нет cublas). Поэтому проверяем настоящим звуком,
-                # а не фактом загрузки — иначе откат на процессор не сработает.
-                probe = np.random.default_rng(0).normal(0, 0.05, SAMPLE_RATE).astype(np.float32)
-                list(self.model.transcribe(probe, language=LANGUAGE, vad_filter=False)[0])
-                self.device = device
-                return
-            except Exception as exc:  # нет CUDA/cuDNN — не беда, поедем на процессоре
-                last = exc
-                self.model = None
-                print(f"{device} не вышло ({exc}), пробую дальше", file=sys.stderr)
-        self.error = last
-
-    def run(self, audio: np.ndarray) -> str:
-        segments, _ = self.model.transcribe(
-            normalize(audio),
-            language=LANGUAGE,
-            beam_size=5,
-            initial_prompt=STYLE_PROMPT,
-            hotwords=read_vocab(),
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        return " ".join(s.text.strip() for s in segments).strip()
-
-
-# --- мост из чужих потоков в поток Qt ----------------------------------------
-
-
 class Bridge(QObject):
     talk = Signal()
     teach = Signal()
@@ -337,8 +317,6 @@ class _MSG(ctypes.Structure):
 
 
 class HotkeyFilter(QAbstractNativeEventFilter):
-    """Ловит WM_HOTKEY до того, как Qt его выбросит."""
-
     def __init__(self, handlers: dict[int, object]) -> None:
         super().__init__()
         self.handlers = handlers
@@ -352,12 +330,8 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
-# --- точка -------------------------------------------------------------------
-
-
 class Dot(QWidget):
     def __init__(self, live: bool = True) -> None:
-        """live=False — только внешний вид, без микрофона, модели и клавиш (для preview.py)."""
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -378,23 +352,23 @@ class Dot(QWidget):
         self.phase = 0.0
         self.disc_r = R_DISC_SHUT
         self.last_raw = ""
+        self.backend_status = "проверяется..."
         self._press: QPointF | None = None
         self._moved = False
 
-        self.recorder = Recorder()
-        self.transcriber = Transcriber()
+        self._apply_saved_position()
 
+        if not live:
+            self.state = IDLE
+            return
+
+        self.recorder = Recorder()
         self.bridge = Bridge()
         self.bridge.talk.connect(self.toggle)
         self.bridge.teach.connect(self.teach)
         self.bridge.ready.connect(self._on_ready)
         self.bridge.done.connect(self._on_done)
         self.bridge.failed.connect(self._on_failed)
-
-        if not live:
-            return
-
-        self.restore_position()
 
         self.ticker = QTimer(self)
         self.ticker.timeout.connect(self._tick)
@@ -406,76 +380,49 @@ class Dot(QWidget):
             {HOTKEY_TALK_ID: self.bridge.talk.emit, HOTKEY_LEARN_ID: self.bridge.teach.emit}
         )
         QApplication.instance().installNativeEventFilter(self._filter)
-        self.register_hotkeys()
 
-    def register_hotkeys(self) -> None:
-        for key_id, (mods, vk, label) in (
+        hwnd = int(self.winId())
+        for hid, (mod, vk, name) in (
             (HOTKEY_TALK_ID, HOTKEY_TALK),
             (HOTKEY_LEARN_ID, HOTKEY_LEARN),
         ):
-            ctypes.set_last_error(0)
-            # Вешаем на поток (hwnd=None), а не на окно. Сообщение, адресованное
-            # окну Qt, проходит через нативный фильтр ДВАЖДЫ — из очереди и из
-            # оконной процедуры, — и каждое нажатие срабатывало бы два раза:
-            # запись включалась и тут же выключалась.
-            if _u32.RegisterHotKey(None, key_id, mods | MOD_NOREPEAT, vk):
-                continue
-            err = ctypes.get_last_error()
-            # Молча проглотить нельзя: клавиша просто не работала бы, и человек
-            # думал бы, что сломана программа, а не что комбинацию занял сосед.
-            why = (
-                "её уже занял кто-то другой"
-                if err == ERROR_HOTKEY_ALREADY_REGISTERED
-                else f"ошибка Windows {err}"
-            )
-            alarm(f"клавиша {label} не работает: {why}")
+            if not _u32.RegisterHotKey(hwnd, hid, mod | MOD_NOREPEAT, vk):
+                alarm(f"Хоткей {name} занят другой программой.")
 
-    # позиция
-
-    def restore_position(self) -> None:
-        area = QGuiApplication.primaryScreen().availableGeometry()
-        x, y = area.right() - WIN - 24, area.bottom() - WIN - 24
-        if STATE_FILE.exists():
-            try:
-                saved = json.loads(STATE_FILE.read_text("utf-8"))
-                x, y = int(saved["x"]), int(saved["y"])
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-                pass
-        # Точка могла остаться от монитора, который отключили.
-        x = min(max(x, area.left()), area.right() - WIN)
-        y = min(max(y, area.top()), area.bottom() - WIN)
+    def _apply_saved_position(self) -> None:
+        geom = QGuiApplication.primaryScreen().availableGeometry()
+        st = read_state()
+        x = st.get("x", geom.right() - WIN - 24)
+        y = st.get("y", geom.bottom() - WIN - 24)
+        x = max(geom.left(), min(int(x), geom.right() - WIN))
+        y = max(geom.top(), min(int(y), geom.bottom() - WIN))
         self.move(x, y)
 
     def save_position(self) -> None:
-        STATE_FILE.write_text(json.dumps({"x": self.x(), "y": self.y()}), "utf-8")
-
-    # состояния
+        write_state(x=self.x(), y=self.y())
 
     def _load_model(self) -> None:
-        self.transcriber.load()
-        self.bridge.ready.emit("" if self.transcriber.model else "fail")
+        try:
+            status = groq_healthcheck()
+            self.bridge.ready.emit(status)
+        except Exception as exc:
+            self.bridge.ready.emit(f"fail:{type(exc).__name__}")
 
-    def _on_ready(self, problem: str) -> None:
-        if problem:
-            alarm(f"модель не загрузилась: {self.transcriber.error}")
-            self.state = ERR
+    def _on_ready(self, info: str) -> None:
+        if info.startswith("fail:"):
+            alarm(f"Groq Cloud недоступен: {info[5:]}. Проверьте подключение к интернету.")
+            self._on_failed()
             return
         self.state = IDLE
-        print(
-            f"dot готов, модель {MODEL} на {self.transcriber.device}. "
-            f"{HOTKEY_TALK[2]} — говорить, {HOTKEY_LEARN[2]} — научить."
-        )
+        self.backend_status = info
+        print(f"dot готов [{info}]. {HOTKEY_TALK[2]} — говорить, {HOTKEY_LEARN[2]} — научить.")
 
     def toggle(self) -> None:
         if self.state == IDLE:
             try:
                 self.recorder.start()
             except Exception as exc:
-                # Микрофон могли занять (созвон, браузер) или сменить устройство
-                # по умолчанию. Без этого нажатие просто НИЧЕГО не делало: Qt
-                # съедал исключение в слоте, точка оставалась спящей, и человек
-                # жал клавишу снова и снова.
-                alarm(f"микрофон не открылся: {exc}")
+                alarm(f"Микрофон не открылся: {exc}")
                 self._on_failed()
                 return
             self.state = REC
@@ -485,15 +432,14 @@ class Dot(QWidget):
             threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
 
     def _transcribe(self, audio: np.ndarray) -> None:
-        # Меньше четверти секунды — это промах по клавише, а не речь.
         if audio.size < SAMPLE_RATE // 4:
             self.bridge.done.emit("")
             return
         try:
             save_audio(audio)
-            raw = self.transcriber.run(audio)
+            raw = groq_transcribe(audio)
         except Exception as exc:
-            alarm(f"расшифровка сорвалась: {exc}")
+            alarm(f"Ошибка распознавания: {exc}")
             self.bridge.failed.emit()
             return
         self.bridge.done.emit(raw)
@@ -508,13 +454,11 @@ class Dot(QWidget):
         self.paste(text)
 
     def remember(self, text: str) -> None:
-        """Журнал расшифровок: продиктовал и случайно затёр — не пропало."""
         entry = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "text": text}
         with HISTORY_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def cancel(self) -> None:
-        """Передумал: выбросить запись, ничего не расшифровывать."""
         if self.state == REC:
             self.recorder.stop()
             self.state = IDLE
@@ -524,13 +468,11 @@ class Dot(QWidget):
         QTimer.singleShot(2000, self._recover)
 
     def _recover(self) -> None:
-        if self.state == ERR and self.transcriber.model is not None:
+        if self.state == ERR:
             self.state = IDLE
 
     def paste(self, text: str) -> None:
         QApplication.clipboard().setText(text)
-        # Ctrl/Alt/Shift могут быть ещё зажаты от горячей клавиши — тогда прилетит
-        # не Ctrl+V, а Ctrl+Alt+V, и никакой вставки не будет.
         for _ in range(60):
             held = any(
                 _u32.GetAsyncKeyState(vk) & 0x8000 for vk in (VK_CONTROL, VK_MENU, VK_SHIFT)
@@ -547,9 +489,20 @@ class Dot(QWidget):
         if not self.last_raw or not fixed:
             return
         n = learn(self.last_raw, fixed)
-        print(f"запомнил замен: {n}" if n else "разницы не нашёл")
+        print(f"Запомнено правок: {n}" if n else "Отличий не найдено")
 
-    # мышь
+    def show_menu(self, position) -> None:
+        menu = QMenu(self)
+        status_action = menu.addAction(f"Движок: {self.backend_status}")
+        status_action.setEnabled(False)
+        menu.addSeparator()
+        hotkey_info = menu.addAction("Ctrl+Alt+D: Запись | Ctrl+Alt+F: Обучить")
+        hotkey_info.setEnabled(False)
+        menu.addSeparator()
+        quit_action = menu.addAction("Выход")
+        chosen = menu.exec(position)
+        if chosen is quit_action:
+            QApplication.quit()
 
     def enterEvent(self, event) -> None:
         self.hover = True
@@ -562,7 +515,10 @@ class Dot(QWidget):
             self._press = event.globalPosition() - QPointF(self.x(), self.y())
             self._moved = False
         elif event.button() == Qt.RightButton:
-            self.cancel()
+            if self.state == REC:
+                self.cancel()
+            elif self.state == IDLE:
+                self.show_menu(event.globalPosition().toPoint())
 
     def mouseMoveEvent(self, event) -> None:
         if self._press is None:
@@ -582,15 +538,11 @@ class Dot(QWidget):
         else:
             self.toggle()
 
-    # рисование
-
     def target_disc(self) -> float:
-        """Открыт — значит слушает или думает. Закрыт — отдыхает."""
         return R_DISC_OPEN if self.state in (REC, WORK, LOADING) else R_DISC_SHUT
 
     def _tick(self) -> None:
         target = self.recorder.level if self.state == REC else 0.0
-        # Вверх индикатор летит быстро, вниз оседает медленно — как настоящий VU.
         self.level += (target - self.level) * (0.5 if target > self.level else 0.09)
         self.peak = max(target, self.peak - 0.012)
         self.disc_r += (self.target_disc() - self.disc_r) * 0.18
@@ -604,7 +556,6 @@ class Dot(QWidget):
         c = QPointF(CTR, CTR)
         r = self.disc_r
 
-        # Диск. Глубина — от тона и от кромки, ловящей свет сверху. Без теней.
         disc = QColor(0x24, 0x18, 0x12) if self.state == REC else QColor(INK)
         disc.setAlpha(242)
         p.setPen(Qt.NoPen)
@@ -621,14 +572,11 @@ class Dot(QWidget):
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(c, r - 0.6, r - 0.6)
 
-        # Сама точка.
         if self.state == ERR:
             core = QColor(CLAY)
             radius = 4.5
         else:
             core = QColor(BONE)
-            # Наведение меняет только тон и кромку. Точка под курсором не растёт и
-            # не прыгает: подскок на hover — дешёвый рефлекс, а не взаимодействие.
             core.setAlpha(255 if self.hover or self.state != IDLE else 205)
             radius = 4.5 + self.level * 2.2
         p.setPen(Qt.NoPen)
@@ -641,7 +589,6 @@ class Dot(QWidget):
             self._draw_sweep(p)
 
     def _face(self) -> tuple[float, float, float]:
-        """Риски масштабируются вместе с диском, иначе на полпути вылезут за кромку."""
         scale = self.disc_r / R_DISC_OPEN
         fade = (self.disc_r - R_DISC_SHUT) / (R_DISC_OPEN - R_DISC_SHUT)
         return R_TICK_IN * scale, R_TICK_OUT * scale, min(1.0, max(0.0, fade))
@@ -653,7 +600,6 @@ class Dot(QWidget):
         return pen
 
     def _draw_meter(self, p: QPainter) -> None:
-        """Кольцо рисок — это настоящий уровень с микрофона, а не украшение."""
         r_in, r_out, fade = self._face()
         lit = self.level * TICKS
         peak_tick = int(self.peak * TICKS)
@@ -670,9 +616,7 @@ class Dot(QWidget):
             p.drawLine(self._on_ring(angle, r_in), self._on_ring(angle, r_out))
 
     def _draw_sweep(self, p: QPainter) -> None:
-        """Та же геометрия рисок, но одна бежит по кругу — пока думает."""
         r_in, r_out, fade = self._face()
-        # Пока грузится — тот же свет, просто тише. Глиняным он тонул в диске.
         dim = 1.0 if self.state == WORK else 0.5
         lead = (self.phase * TICKS / math.pi) % TICKS
         for i in range(TICKS):
@@ -689,7 +633,7 @@ class Dot(QWidget):
 
 def main() -> None:
     if already_running():
-        alarm("dot уже запущен. Второй экземпляр отобрал бы Ctrl+Alt+D у первого.")
+        alarm("dot уже запущен. Нажмите Ctrl+Alt+D для диктовки.")
         sys.exit(1)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

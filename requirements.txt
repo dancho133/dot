@@ -1,13 +1,4 @@
-faster-whisper>=1.1.0
-sounddevice>=0.4.6
+httpx>=0.27.0
 numpy>=1.26
-PySide6>=6.6
-
-# Без них ctranslate2 создаёт модель на видеокарте, а падает уже при
-# распознавании: "cublas64_12.dll is not found". На машине без NVIDIA просто
-# не установятся — dot тогда сам уедет на процессор.
-nvidia-cublas-cu12; platform_system == "Windows" or platform_system == "Linux"
-nvidia-cudnn-cu12; platform_system == "Windows" or platform_system == "Linux"
-
-# keyboard не нужен: он разбирает клавиши по буквам текущей раскладки и при
-# русской не узнаёт свои же хоткеи. Работаем через RegisterHotKey из user32.
+sounddevice>=0.4.6; platform_system == "Windows"
+PySide6>=6.6; platform_system == "Windows"
