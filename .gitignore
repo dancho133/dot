@@ -2,12 +2,9 @@
 __pycache__/
 .test-tmp/
 
-# Личное: где стоит точка, что она выучила и всё, что ты надиктовал.
+# Личное
 state.json
+state.json.tmp
 corrections.json
 history.jsonl
 last.wav
-
-# Картинки собираются из preview.py одной командой.
-preview.png
-preview-zoom.png
